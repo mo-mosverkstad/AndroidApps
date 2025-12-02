@@ -324,7 +324,7 @@ data class TabMeta(
     val isDirty: Boolean = false
 )
 
-data class EditorUiState(
+data class EditorState(
     val tabs: List<TabMeta> = emptyList(),
     val selectedIndex: Int = 0,
     val visibleText: String = "",
@@ -333,122 +333,286 @@ data class EditorUiState(
     val canRedo: Boolean = false
 )
 
-class EditorViewModel : ViewModel() {
+class EditorModel {
+
     private val docs = mutableMapOf<String, PieceTable>()
     private val histories = mutableMapOf<String, HistoryManager>()
-    private val _uiState = MutableStateFlow(EditorUiState())
-    val uiState: StateFlow<EditorUiState> = _uiState
+
+    private var state = EditorState()
+    fun getState(): EditorState = state
+
+    private fun clampIndex(tabs: List<TabMeta>, idx: Int): Int =
+        when {
+            tabs.isEmpty() -> 0
+            idx < 0 -> 0
+            idx > tabs.lastIndex -> tabs.lastIndex
+            else -> idx
+        }
+
+    // -----------------------------------------------------
+    // TAB CREATION
+    // -----------------------------------------------------
+    fun createTab(initialText: String, fileName: String, fileUri: Uri? = null): EditorState {
+        val docId = UUID.randomUUID().toString()
+
+        docs[docId] = PieceTable(initialText)
+        histories[docId] = HistoryManager()
+
+        val newTab = TabMeta(docId = docId, fileName = fileName, fileUri = fileUri, isDirty = false)
+        val tabs = state.tabs + newTab
+        val idx = tabs.lastIndex
+
+        val doc = docs[docId]!!
+
+        state = state.copy(
+            tabs = tabs,
+            selectedIndex = idx,
+            visibleText = doc.toString(),
+            selection = TextRange(doc.length),
+            canUndo = false,
+            canRedo = false
+        )
+        return state
+    }
+
+    // -----------------------------------------------------
+    // TAB CLOSING
+    // -----------------------------------------------------
+    fun closeTab(tabId: String): EditorState {
+        val idx = state.tabs.indexOfFirst { it.id == tabId }
+        if (idx == -1) return state
+
+        val newTabs = state.tabs.toMutableList().also { it.removeAt(idx) }
+        val newIdx = clampIndex(newTabs, idx)
+
+        val newVisible =
+            if (newTabs.isEmpty()) ""
+            else {
+                val docId = newTabs[newIdx].docId
+                docs[docId]?.toString() ?: ""
+            }
+
+        val hist = newTabs.getOrNull(newIdx)?.let { histories[it.docId] }
+
+        state = state.copy(
+            tabs = newTabs,
+            selectedIndex = newIdx,
+            visibleText = newVisible,
+            selection = TextRange(newVisible.length),
+            canUndo = hist?.canUndo ?: false,
+            canRedo = hist?.canRedo ?: false
+        )
+        return state
+    }
+
+    fun markTabClean(tabId: String) {
+        val updatedTabs = state.tabs.toMutableList()
+        val idx = updatedTabs.indexOfFirst { it.id == tabId }
+        if (idx >= 0) {
+            updatedTabs[idx] = updatedTabs[idx].copy(isDirty = false)
+            state = state.copy(tabs = updatedTabs)
+        }
+    }
+
+    fun updateTabFileInfo(tabId: String, newFileName: String, newUri: Uri) {
+        val updatedTabs = state.tabs.toMutableList()
+        val idx = updatedTabs.indexOfFirst { it.id == tabId }
+        if (idx >= 0) {
+            updatedTabs[idx] = updatedTabs[idx].copy(fileName = newFileName, fileUri = newUri)
+            state = state.copy(tabs = updatedTabs)
+        }
+    }
+
+    // -----------------------------------------------------
+    // TAB SELECTION
+    // -----------------------------------------------------
+    fun selectTab(tabId: String): EditorState {
+        val idx = state.tabs.indexOfFirst { it.id == tabId }
+        if (idx == -1) return state
+
+        val tab = state.tabs[idx]
+        histories[tab.docId]?.finalizeExternal()
+
+        val doc = docs[tab.docId]!!
+
+        state = state.copy(
+            selectedIndex = idx,
+            visibleText = doc.toString(),
+            selection = TextRange(doc.length),
+            canUndo = histories[tab.docId]!!.canUndo,
+            canRedo = histories[tab.docId]!!.canRedo
+        )
+        return state
+    }
+
+    // -----------------------------------------------------
+    // UNDO / REDO
+    // -----------------------------------------------------
+    fun undo(): EditorState {
+        val tab = state.tabs[state.selectedIndex]
+        val doc = docs[tab.docId]!!
+        val hist = histories[tab.docId]!!
+
+        hist.finalizeExternal()
+        hist.undo(doc)
+
+        return rebuildStateAfterHistory(doc, hist)
+    }
+
+    fun redo(): EditorState {
+        val tab = state.tabs[state.selectedIndex]
+        val doc = docs[tab.docId]!!
+        val hist = histories[tab.docId]!!
+
+        hist.finalizeExternal()
+        hist.redo(doc)
+
+        return rebuildStateAfterHistory(doc, hist)
+    }
+
+    private fun rebuildStateAfterHistory(doc: PieceTable, hist: HistoryManager): EditorState {
+        val newText = doc.toString()
+        val newSel = TextRange(newText.length)
+
+        val updatedTabs = state.tabs.toMutableList()
+        updatedTabs[state.selectedIndex] = updatedTabs[state.selectedIndex].copy(isDirty = true)
+
+        state = state.copy(
+            tabs = updatedTabs,
+            visibleText = newText,
+            selection = newSel,
+            canUndo = hist.canUndo,
+            canRedo = hist.canRedo
+        )
+        return state
+    }
+
+    // -----------------------------------------------------
+    // UI TEXT DIFF APPLIED TO MODEL
+    // -----------------------------------------------------
+    fun applyTextChange(removeStart: Int, removeLen: Int, addText: String): EditorState {
+        val tab = state.tabs[state.selectedIndex]
+        val doc = docs[tab.docId]!!
+        val hist = histories[tab.docId]!!
+
+        val editType = when {
+            removeLen > 0 && addText.isEmpty() -> HistoryManager.EditType.DELETING
+            removeLen == 0 && addText.isNotEmpty() -> HistoryManager.EditType.INSERTING
+            else -> HistoryManager.EditType.OTHER
+        }
+
+        if (editType == HistoryManager.EditType.OTHER)
+            hist.finalizeExternal()
+
+        if (removeLen > 0)
+            hist.pushOp(doc.deleteWithOp(removeStart, removeLen), HistoryManager.EditType.DELETING)
+
+        if (addText.isNotEmpty())
+            hist.pushOp(doc.insertWithOp(removeStart, addText), HistoryManager.EditType.INSERTING)
+
+        val newText = doc.toString()
+        val caret = removeStart + addText.length
+        val newSelection = TextRange(caret.coerceIn(0, newText.length))
+
+        val updatedTabs = state.tabs.toMutableList().also {
+            it[state.selectedIndex] = it[state.selectedIndex].copy(isDirty = true)
+        }
+
+        state = state.copy(
+            tabs = updatedTabs,
+            visibleText = newText,
+            selection = newSelection,
+            canUndo = hist.canUndo,
+            canRedo = hist.canRedo
+        )
+        return state
+    }
+}
+
+class EditorViewModel : ViewModel() {
+
+    private val model = EditorModel()
+
+    private val _uiState = MutableStateFlow(EditorState())
+    val uiState: StateFlow<EditorState> = _uiState
 
     @Volatile
     var applyingModelUpdate = false
 
-    private val editorExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "editor-dispatcher").apply { isDaemon = true } }
-    private val editorDispatcher = editorExecutor.asCoroutineDispatcher()
+    private val singleThread = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "editor-dispatcher").apply { isDaemon = true }
+    }
+    private val editorDispatcher = singleThread.asCoroutineDispatcher()
     private var diffJob: Job? = null
 
-    // helper to clamp selected index safely for a given tabs list
-    private fun clampIndexFor(tabs: List<TabMeta>, idx: Int): Int = when {
-        tabs.isEmpty() -> 0
-        idx < 0 -> 0
-        idx > tabs.lastIndex -> tabs.lastIndex
-        else -> idx
+    private fun pushState() {
+        _uiState.value = model.getState()
     }
 
-    fun createTab(initialText: String = "", fileName: String = "New File"): String {
-        val docId = UUID.randomUUID().toString()
-        docs[docId] = PieceTable(initialText)
-        histories[docId] = HistoryManager()
-        val meta = TabMeta(docId = docId, fileName = fileName)
-        val tabs = _uiState.value.tabs + meta
-        val newIndex = tabs.lastIndex
-        val safeIndex = clampIndexFor(tabs, newIndex)
-        _uiState.value = _uiState.value.copy(
-            tabs = tabs,
-            selectedIndex = safeIndex,
-            visibleText = docs[docId]!!.toString(),
-            selection = TextRange(docs[docId]!!.length),
-            canUndo = false,
-            canRedo = false
-        )
-        return docId
+    // ---------------------------------------------------------
+    // TABS
+    // ---------------------------------------------------------
+    fun newTab() {
+        model.createTab("", "New File")
+        pushState()
     }
-
-    fun newTab() = createTab(initialText = "", fileName = "New File ${_uiState.value.tabs.size + 1}")
 
     fun closeTabById(id: String) {
-        val cur = _uiState.value
-        val idx = cur.tabs.indexOfFirst { it.id == id }
-        if (idx == -1) return
-
-        val remaining = cur.tabs.toMutableList().also { it.removeAt(idx) }
-        val newSelected = clampIndexFor(remaining, idx)
-
-        if (remaining.isEmpty()) {
-            _uiState.value = cur.copy(
-                tabs = remaining,
-                selectedIndex = newSelected,
-                visibleText = "",
-                selection = TextRange(0),
-                canUndo = false,
-                canRedo = false
-            )
-        } else {
-            val selTab = remaining[newSelected]
-            val doc = docs[selTab.docId]
-            val hist = histories[selTab.docId]
-            _uiState.value = cur.copy(
-                tabs = remaining,
-                selectedIndex = newSelected,
-                visibleText = doc?.toString() ?: "",
-                selection = TextRange((doc?.length ?: 0).coerceAtLeast(0)),
-                canUndo = hist?.canUndo == true,
-                canRedo = hist?.canRedo == true
-            )
-        }
+        model.closeTab(id)
+        pushState()
     }
 
     fun selectTabById(id: String) {
-        val idx = _uiState.value.tabs.indexOfFirst { it.id == id }
-        if (idx != -1) {
-            val tab = _uiState.value.tabs[idx]
-            val doc = docs[tab.docId] ?: PieceTable("")
-            // finalize any pending batch on switching tabs (safe)
-            histories[tab.docId]?.finalizeExternal()
-            _uiState.value = _uiState.value.copy(
-                selectedIndex = idx,
-                visibleText = doc.toString(),
-                selection = TextRange(doc.length),
-                canUndo = histories[tab.docId]?.canUndo == true,
-                canRedo = histories[tab.docId]?.canRedo == true
-            )
+        model.selectTab(id)
+        pushState()
+    }
+
+    fun markTabClean(tabId: String) {
+        model.markTabClean(tabId)
+        pushState()
+    }
+
+    fun updateTabFileInfo(tabId: String, newFileName: String, newUri: Uri) {
+        model.updateTabFileInfo(tabId, newFileName, newUri)
+        pushState()
+    }
+
+
+    // ---------------------------------------------------------
+    // UNDO / REDO
+    // ---------------------------------------------------------
+    fun undo() {
+        viewModelScope.launch(editorDispatcher) {
+            model.undo()
+            withContext(Dispatchers.Main) { pushState() }
         }
     }
 
-    fun finalizeCurrentHistoryBatch() {
-        val cur = _uiState.value
-        val safeIdx = clampIndexFor(cur.tabs, cur.selectedIndex)
-        if (safeIdx !in cur.tabs.indices) return
-        val tab = cur.tabs[safeIdx]
-        histories[tab.docId]?.finalizeExternal()
-        val hist = histories[tab.docId]
-        _uiState.value = _uiState.value.copy(canUndo = hist?.canUndo == true, canRedo = hist?.canRedo == true)
+    fun redo() {
+        viewModelScope.launch(editorDispatcher) {
+            model.redo()
+            withContext(Dispatchers.Main) { pushState() }
+        }
     }
 
+    // ---------------------------------------------------------
+    // TEXT CHANGE FROM UI
+    // ---------------------------------------------------------
     fun applyTextChangeFromUi(newValue: TextFieldValue) {
         diffJob?.cancel()
         diffJob = viewModelScope.launch {
             delay(8)
+
             withContext(editorDispatcher) {
-                val cur = _uiState.value
-                val safeIdx = clampIndexFor(cur.tabs, cur.selectedIndex)
-                if (safeIdx !in cur.tabs.indices) return@withContext
-                val tab = cur.tabs[safeIdx]
-                val doc = docs[tab.docId] ?: return@withContext
-                val history = histories[tab.docId] ?: return@withContext
+                val cur = model.getState()
                 val old = cur.visibleText
                 val fresh = newValue.text
                 if (old == fresh) {
-                    withContext(Dispatchers.Main) { _uiState.value = _uiState.value.copy(selection = newValue.selection) }
+                    withContext(Dispatchers.Main) {
+                        applyingModelUpdate = true
+                        _uiState.value = cur.copy(selection = newValue.selection)
+                        applyingModelUpdate = false
+                    }
                     return@withContext
                 }
 
@@ -459,139 +623,52 @@ class EditorViewModel : ViewModel() {
 
                 // compute suffix
                 var suffix = 0
-                val oldSuffixLen = old.length - prefix
-                val newSuffixLen = fresh.length - prefix
-                while (suffix < oldSuffixLen && suffix < newSuffixLen &&
+                val oldRemaining = old.length - prefix
+                val newRemaining = fresh.length - prefix
+                while (suffix < oldRemaining && suffix < newRemaining &&
                     old[old.length - 1 - suffix] == fresh[fresh.length - 1 - suffix]) suffix++
 
                 val removeStart = prefix
                 val removeLen = old.length - prefix - suffix
-                val addText = if (fresh.length - prefix - suffix > 0) fresh.substring(prefix, fresh.length - suffix) else ""
+                val addText = if (fresh.length - prefix - suffix > 0)
+                    fresh.substring(prefix, fresh.length - suffix)
+                else ""
 
-                val editType = when {
-                    removeLen > 0 && addText.isEmpty() -> HistoryManager.EditType.DELETING
-                    removeLen == 0 && addText.isNotEmpty() -> HistoryManager.EditType.INSERTING
-                    else -> HistoryManager.EditType.OTHER
-                }
-
-                if (editType == HistoryManager.EditType.OTHER) {
-                    history.finalizeExternal()
-                }
-
-                if (removeLen > 0) {
-                    val op = doc.deleteWithOp(removeStart, removeLen)
-                    history.pushOp(op, HistoryManager.EditType.DELETING)
-                }
-
-                if (addText.isNotEmpty()) {
-                    val op = doc.insertWithOp(removeStart, addText)
-                    history.pushOp(op, HistoryManager.EditType.INSERTING)
-                }
+                model.applyTextChange(removeStart, removeLen, addText)
 
                 withContext(Dispatchers.Main) {
                     applyingModelUpdate = true
-                    try {
-                        val newFull = doc.toString()
-                        val caret = removeStart + addText.length
-                        val newSelection = TextRange(caret.coerceIn(0, newFull.length))
-                        val updatedTabs = _uiState.value.tabs.toMutableList()
-                        val safeIdxMain = clampIndexFor(updatedTabs, _uiState.value.selectedIndex)
-                        if (safeIdxMain in updatedTabs.indices) updatedTabs[safeIdxMain] = updatedTabs[safeIdxMain].copy(isDirty = true)
-
-                        _uiState.value = _uiState.value.copy(
-                            tabs = updatedTabs,
-                            visibleText = newFull,
-                            selection = newSelection,
-                            canUndo = history.canUndo,
-                            canRedo = history.canRedo
-                        )
-                    } finally { applyingModelUpdate = false }
+                    pushState()
+                    applyingModelUpdate = false
                 }
             }
         }
     }
 
-    fun undo() = runUndoRedo(true)
-    fun redo() = runUndoRedo(false)
-
-    private fun runUndoRedo(isUndo: Boolean) {
-        viewModelScope.launch {
-            withContext(editorDispatcher) {
-                val cur = _uiState.value
-                val safeIdx = clampIndexFor(cur.tabs, cur.selectedIndex)
-                if (safeIdx !in cur.tabs.indices) return@withContext
-                val tab = cur.tabs[safeIdx]
-                val doc = docs[tab.docId] ?: return@withContext
-                val history = histories[tab.docId] ?: return@withContext
-
-                history.finalizeExternal()
-
-                if (isUndo) history.undo(doc) else history.redo(doc)
-
-                withContext(Dispatchers.Main) {
-                    applyingModelUpdate = true
-                    try {
-                        val newFull = doc.toString()
-                        val newSel = TextRange(newFull.length)
-                        val updatedTabs = _uiState.value.tabs.toMutableList()
-                        val safeIdxMain = clampIndexFor(updatedTabs, _uiState.value.selectedIndex)
-                        if (safeIdxMain in updatedTabs.indices) updatedTabs[safeIdxMain] = updatedTabs[safeIdxMain].copy(isDirty = true)
-
-                        _uiState.value = _uiState.value.copy(
-                            tabs = updatedTabs,
-                            visibleText = newFull,
-                            selection = newSel,
-                            canUndo = history.canUndo,
-                            canRedo = history.canRedo
-                        )
-                    } finally { applyingModelUpdate = false }
-                }
-            }
-        }
-    }
-
+    // ---------------------------------------------------------
+    // FILE I/O (ANDROID)
+    // ---------------------------------------------------------
     fun openFile(context: Context, uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
-            val content = readFile(context, uri)
-            val docId = UUID.randomUUID().toString()
-            docs[docId] = PieceTable(content)
-            histories[docId] = HistoryManager()
+            val text = readFile(context, uri)
             val name = getFileName(context, uri) ?: "Untitled"
-            val meta = TabMeta(docId = docId, fileName = name, fileUri = uri, isDirty = false)
-            withContext(Dispatchers.Main) {
-                val tabs = _uiState.value.tabs + meta
-                val newIndex = tabs.lastIndex
-                val safeIndex = clampIndexFor(tabs, newIndex)
-                _uiState.value = _uiState.value.copy(
-                    tabs = tabs,
-                    selectedIndex = safeIndex,
-                    visibleText = docs[docId]!!.toString(),
-                    selection = TextRange(docs[docId]!!.length),
-                    canUndo = false,
-                    canRedo = false
-                )
-            }
+
+            model.createTab(text, name, uri)
+
+            withContext(Dispatchers.Main) { pushState() }
         }
     }
 
     fun saveToUri(context: Context, uri: Uri) {
-        val cur = _uiState.value
-        val safeIdx = clampIndexFor(cur.tabs, cur.selectedIndex)
-        if (safeIdx !in cur.tabs.indices) return
-        val tab = cur.tabs[safeIdx]
-        val doc = docs[tab.docId] ?: return
+        val text = model.getState().visibleText
         viewModelScope.launch(Dispatchers.IO) {
-            writeFile(context, uri, doc.toString())
-            val name = getFileName(context, uri) ?: tab.fileName
-            withContext(Dispatchers.Main) {
-                val updatedTabs = _uiState.value.tabs.toMutableList()
-                val safeIdxMain = clampIndexFor(updatedTabs, _uiState.value.selectedIndex)
-                if (safeIdxMain in updatedTabs.indices) updatedTabs[safeIdxMain] = updatedTabs[safeIdxMain].copy(isDirty = false, fileName = name, fileUri = uri)
-                _uiState.value = _uiState.value.copy(tabs = updatedTabs)
-            }
+            writeFile(context, uri, text)
         }
     }
 
+    // ---------------------------------------------------------
+    // HELPERS
+    // ---------------------------------------------------------
     private fun readFile(context: Context, uri: Uri): String {
         return context.contentResolver.openInputStream(uri)?.use { stream ->
             BufferedReader(InputStreamReader(stream)).use { it.readText() }
@@ -607,9 +684,9 @@ class EditorViewModel : ViewModel() {
     private fun getFileName(context: Context, uri: Uri): String? {
         var name: String? = null
         context.contentResolver.query(uri, null, null, null, null)?.use { cursor: Cursor ->
-            val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (cursor.moveToFirst() && idx >= 0) {
-                name = cursor.getString(idx)
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (cursor.moveToFirst() && index >= 0) {
+                name = cursor.getString(index)
             }
         }
         return name
@@ -617,9 +694,10 @@ class EditorViewModel : ViewModel() {
 
     override fun onCleared() {
         super.onCleared()
-        editorExecutor.shutdownNow()
+        singleThread.shutdownNow()
     }
 }
+
 
 // -------------------- MainActivity + Compose --------------------
 class MainActivity : ComponentActivity() {
@@ -636,48 +714,79 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+
 @Composable
 fun TextEditorHost(vm: EditorViewModel = viewModel()) {
     val context = LocalContext.current
     val state by vm.uiState.collectAsState()
 
+    // Open file launcher
     val openLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.openFile(context, uri)
     }
+
+    // Save As launcher with updated logic
     val saveAsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
-        if (uri != null) vm.saveToUri(context, uri)
-        if (uri != null) Toast.makeText(context, "File saved!", Toast.LENGTH_SHORT).show()
+        if (uri != null) {
+            val idx = state.selectedIndex.coerceIn(0, maxOf(0, state.tabs.lastIndex))
+            if (idx in state.tabs.indices) {
+                val tab = state.tabs[idx]
+                vm.saveToUri(context, uri)
+                vm.updateTabFileInfo(tab.id, tab.fileName, uri) // ✅ Update file info
+                vm.markTabClean(tab.id) // ✅ Reset dirty flag
+            }
+            Toast.makeText(context, "File saved!", Toast.LENGTH_SHORT).show()
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        Row(modifier = Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-            Button(onClick = { openLauncher.launch(arrayOf("*/*")) }, enabled = true) { Text("Load") }
+        // Toolbar Row
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(8.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(onClick = { openLauncher.launch(arrayOf("*/*")) }, enabled = true) {
+                Text("Load")
+            }
+
+            // ✅ Save button: mark tab clean after saving
             Button(onClick = {
                 val idx = state.selectedIndex.coerceIn(0, maxOf(0, state.tabs.lastIndex))
                 if (idx in state.tabs.indices) {
                     val tab = state.tabs[idx]
-                    if (tab.fileUri != null) vm.saveToUri(context, tab.fileUri)
-                    else saveAsLauncher.launch(tab.fileName)
+                    if (tab.fileUri != null) {
+                        vm.saveToUri(context, tab.fileUri)
+                        vm.markTabClean(tab.id) // ✅ Reset dirty flag
+                    } else {
+                        saveAsLauncher.launch(tab.fileName)
+                    }
                 }
-            }, enabled = state.tabs.isNotEmpty()) { Text("Save") }
+            }, enabled = state.tabs.isNotEmpty()) {
+                Text("Save")
+            }
+
+            // ✅ Save As button: triggers launcher
             Button(onClick = {
                 val idx = state.selectedIndex.coerceIn(0, maxOf(0, state.tabs.lastIndex))
                 if (idx in state.tabs.indices) {
                     val tab = state.tabs[idx]
                     saveAsLauncher.launch(tab.fileName)
                 }
-            }, enabled = state.tabs.isNotEmpty()) { Text("Save As") }
+            }, enabled = state.tabs.isNotEmpty()) {
+                Text("Save As")
+            }
+
             Button(onClick = { vm.undo() }, enabled = state.canUndo) { Text("Undo") }
             Button(onClick = { vm.redo() }, enabled = state.canRedo) { Text("Redo") }
         }
 
+        // Tabs Row
         Row(verticalAlignment = Alignment.CenterVertically) {
-            val tabsSnapshot = state.tabs      // snapshot once
-            val selectedIndexForRow = tabsSnapshot
-                .let { tabs ->
-                    if (tabs.isEmpty()) 0
-                    else state.selectedIndex.coerceIn(0, tabs.lastIndex)
-                }
+            val tabsSnapshot = state.tabs
+            val selectedIndexForRow = tabsSnapshot.let { tabs ->
+                if (tabs.isEmpty()) 0 else state.selectedIndex.coerceIn(0, tabs.lastIndex)
+            }
 
             key(tabsSnapshot.size, tabsSnapshot.map { it.id }.hashCode()) {
                 if (tabsSnapshot.isNotEmpty()) {
@@ -688,15 +797,19 @@ fun TextEditorHost(vm: EditorViewModel = viewModel()) {
                     ) {
                         tabsSnapshot.forEachIndexed { idx, tab ->
                             key(tab.id) {
-                                Tab(selected = idx == selectedIndexForRow, onClick = { vm.selectTabById(tab.id) }, text = {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(tab.fileName + if (tab.isDirty) "*" else "", maxLines = 1)
-                                        Spacer(Modifier.width(4.dp))
-                                        IconButton(onClick = { vm.closeTabById(tab.id) }, modifier = Modifier.size(22.dp)) {
-                                            Icon(Icons.Default.Close, contentDescription = "Close Tab", modifier = Modifier.size(16.dp))
+                                Tab(
+                                    selected = idx == selectedIndexForRow,
+                                    onClick = { vm.selectTabById(tab.id) },
+                                    text = {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(tab.fileName + if (tab.isDirty) "*" else "", maxLines = 1)
+                                            Spacer(Modifier.width(4.dp))
+                                            IconButton(onClick = { vm.closeTabById(tab.id) }, modifier = Modifier.size(22.dp)) {
+                                                Icon(Icons.Default.Close, contentDescription = "Close Tab", modifier = Modifier.size(16.dp))
+                                            }
                                         }
                                     }
-                                })
+                                )
                             }
                         }
                     }
@@ -708,22 +821,40 @@ fun TextEditorHost(vm: EditorViewModel = viewModel()) {
             IconButton(onClick = { vm.newTab() }) { Icon(Icons.Default.Add, contentDescription = "New Tab") }
         }
 
-
+        // Editor Area
         Box(modifier = Modifier.fillMaxSize().padding(8.dp)) {
-            var textState by remember(state.tabs, state.visibleText) { mutableStateOf(TextFieldValue(state.visibleText, state.selection)) }
+            var textState by remember(state.tabs, state.visibleText) {
+                mutableStateOf(TextFieldValue(state.visibleText, state.selection))
+            }
 
-            LaunchedEffect(state.visibleText, state.selection) { textState = TextFieldValue(state.visibleText, state.selection) }
+            LaunchedEffect(state.visibleText, state.selection) {
+                textState = TextFieldValue(state.visibleText, state.selection)
+            }
 
             if (state.tabs.isEmpty()) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Open or create a file to start editing") }
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Open or create a file to start editing")
+                }
             } else {
-                BasicTextField(value = textState, onValueChange = { newValue ->
-                    if (vm.applyingModelUpdate) { textState = newValue; return@BasicTextField }
-                    if (newValue.text == textState.text) { textState = newValue; vm.applyTextChangeFromUi(newValue); return@BasicTextField }
-                    textState = newValue
-                    vm.applyTextChangeFromUi(newValue)
-                }, modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()))
+                BasicTextField(
+                    value = textState,
+                    onValueChange = { newValue ->
+                        if (vm.applyingModelUpdate) {
+                            textState = newValue
+                            return@BasicTextField
+                        }
+                        if (newValue.text == textState.text) {
+                            textState = newValue
+                            vm.applyTextChangeFromUi(newValue)
+                            return@BasicTextField
+                        }
+                        textState = newValue
+                        vm.applyTextChangeFromUi(newValue)
+                    },
+                    modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                )
             }
         }
     }
 }
+
