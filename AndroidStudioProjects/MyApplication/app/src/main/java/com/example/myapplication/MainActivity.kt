@@ -130,27 +130,6 @@ class PieceTable(originalText: String = "") {
         sb.append(src.substring(piece.offset + localStart, piece.offset + localStart + localLen))
     }
 
-    fun getSubstring(start: Int, len: Int): String {
-        require(start >= 0 && len >= 0 && start + len <= length)
-        val sb = StringBuilder(len)
-        fun walk(node: Node?, leftIndex: Int) {
-            if (node == null) return
-            val leftLen = node.left?.subtreeLen ?: 0
-            val nodeStartIndex = leftIndex + leftLen
-            if (start < nodeStartIndex) walk(node.left, leftIndex)
-            val piece = node.piece
-            val pieceGlobalEnd = nodeStartIndex + piece.length
-            val overlapStart = maxOf(start, nodeStartIndex)
-            val overlapEnd = minOf(start + len, pieceGlobalEnd)
-            if (overlapStart < overlapEnd) {
-                appendFromPiece(sb, piece, overlapStart - nodeStartIndex, overlapEnd - overlapStart)
-            }
-            if (start + len > pieceGlobalEnd) walk(node.right, pieceGlobalEnd)
-        }
-        walk(root, 0)
-        return sb.toString()
-    }
-
     override fun toString(): String {
         val sb = StringBuilder(length)
         fun inorder(n: Node?) {
@@ -227,33 +206,111 @@ class PieceTable(originalText: String = "") {
 }
 
 // -------------------- HistoryManager --------------------
+
+/**
+ * Simplified and robust HistoryManager that stores *original* ops (not inverses).
+ * Behavior:
+ * - pushOp(op, type) to add an operation (op is the operation that WAS applied to the document)
+ * - batching of consecutive INSERTING or DELETING ops into one undo entry
+ * - finalizeExternal() to finalize current batch (e.g. on Enter, selection change)
+ * - undo(doc) applies inverses in reverse order
+ * - redo(doc) reapplies original ops in original order
+ */
 class HistoryManager {
-    private val undo = ArrayDeque<PieceTable.Op>()
-    private val redo = ArrayDeque<PieceTable.Op>()
-    val canUndo: Boolean get() = undo.isNotEmpty()
+
+    enum class EditType {
+        INSERTING,
+        DELETING,
+        OTHER
+    }
+
+    private val undo = ArrayDeque<List<PieceTable.Op>>()
+    private val redo = ArrayDeque<List<PieceTable.Op>>()
+
+    private var currentBatch: MutableList<PieceTable.Op> = mutableListOf()
+    private var lastEditType: EditType? = null
+
+    val canUndo: Boolean get() = undo.isNotEmpty() || currentBatch.isNotEmpty()
     val canRedo: Boolean get() = redo.isNotEmpty()
 
-    fun pushInverse(op: PieceTable.Op) {
-        undo.addLast(op)
+    private fun shouldMerge(type: EditType): Boolean {
+        if (currentBatch.isEmpty()) return true
+        return (lastEditType == type) && (type == EditType.INSERTING || type == EditType.DELETING)
+    }
+
+    @Synchronized
+    fun pushOp(op: PieceTable.Op, type: EditType) {
+        if (type == EditType.OTHER) {
+            finalizeBatchLocked()
+            undo.addLast(listOf(op))
+            redo.clear()
+            lastEditType = null
+            return
+        }
+
+        if (!shouldMerge(type)) {
+            finalizeBatchLocked()
+        }
+
+        currentBatch.add(op)
+        lastEditType = type
         redo.clear()
     }
 
-    fun undo(doc: PieceTable): PieceTable.Op? {
-        if (undo.isEmpty()) return null
-        val op = undo.removeLast()
-        val redoOp = doc.invert(op)
-        doc.apply(op)
-        redo.addLast(redoOp)
-        return op
+    @Synchronized
+    fun finalizeExternal() {
+        finalizeBatchLocked()
     }
 
-    fun redo(doc: PieceTable): PieceTable.Op? {
-        if (redo.isEmpty()) return null
-        val op = redo.removeLast()
-        val inv = doc.invert(op)
-        doc.apply(op)
-        undo.addLast(inv)
-        return op
+    @Synchronized
+    private fun finalizeBatchLocked() {
+        if (currentBatch.isNotEmpty()) {
+            undo.addLast(currentBatch.toList())
+            currentBatch.clear()
+        }
+        lastEditType = null
+    }
+
+    @Synchronized
+    fun undo(doc: PieceTable): Boolean {
+        finalizeBatchLocked()
+        val batch = if (undo.isEmpty()) null else undo.removeLast() ?: return false
+        val redoBatch = mutableListOf<PieceTable.Op>()
+
+        // Apply inverses in reverse order
+        if (batch != null) {
+            for (op in batch.asReversed()) {
+                val inv = doc.invert(op)
+                doc.apply(inv)
+                redoBatch.add(op) // for redo we will reapply original ops
+            }
+        }
+
+        // push original ops for redo in their original order
+        redo.addLast(redoBatch.asReversed().toMutableList())
+        lastEditType = null
+        return true
+    }
+
+    @Synchronized
+    fun redo(doc: PieceTable): Boolean {
+        val batch = if (redo.isEmpty()) null else redo.removeLast() ?: return false
+        val undoBatch = mutableListOf<PieceTable.Op>()
+
+        if (batch != null) {
+            for (op in batch) {
+                doc.apply(op)
+                undoBatch.add(op)
+            }
+        }
+
+        undo.addLast(undoBatch.toList())
+        lastEditType = null
+        return true
+    }
+
+    override fun toString(): String {
+        return "HistoryManager(undo=${undo.size}, redo=${redo.size}, pending=${currentBatch.size})"
     }
 }
 
@@ -281,7 +338,10 @@ class EditorViewModel : ViewModel() {
     private val histories = mutableMapOf<String, HistoryManager>()
     private val _uiState = MutableStateFlow(EditorUiState())
     val uiState: StateFlow<EditorUiState> = _uiState
-    @Volatile var applyingModelUpdate = false
+
+    @Volatile
+    var applyingModelUpdate = false
+
     private val editorExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "editor-dispatcher").apply { isDaemon = true } }
     private val editorDispatcher = editorExecutor.asCoroutineDispatcher()
     private var diffJob: Job? = null
@@ -352,6 +412,8 @@ class EditorViewModel : ViewModel() {
         if (idx != -1) {
             val tab = _uiState.value.tabs[idx]
             val doc = docs[tab.docId] ?: PieceTable("")
+            // finalize any pending batch on switching tabs (safe)
+            histories[tab.docId]?.finalizeExternal()
             _uiState.value = _uiState.value.copy(
                 selectedIndex = idx,
                 visibleText = doc.toString(),
@@ -362,7 +424,17 @@ class EditorViewModel : ViewModel() {
         }
     }
 
-    fun applyTextChangeFromUi(newValue: androidx.compose.ui.text.input.TextFieldValue) {
+    fun finalizeCurrentHistoryBatch() {
+        val cur = _uiState.value
+        val safeIdx = clampIndexFor(cur.tabs, cur.selectedIndex)
+        if (safeIdx !in cur.tabs.indices) return
+        val tab = cur.tabs[safeIdx]
+        histories[tab.docId]?.finalizeExternal()
+        val hist = histories[tab.docId]
+        _uiState.value = _uiState.value.copy(canUndo = hist?.canUndo == true, canRedo = hist?.canRedo == true)
+    }
+
+    fun applyTextChangeFromUi(newValue: TextFieldValue) {
         diffJob?.cancel()
         diffJob = viewModelScope.launch {
             delay(8)
@@ -380,15 +452,15 @@ class EditorViewModel : ViewModel() {
                     return@withContext
                 }
 
-                val prefix = sequence {
-                    val min = minOf(old.length, fresh.length)
-                    var i = 0
-                    while (i < min && old[i] == fresh[i]) { yield(i); i++ }
-                }.count()
+                // compute prefix
+                val min = minOf(old.length, fresh.length)
+                var prefix = 0
+                while (prefix < min && old[prefix] == fresh[prefix]) prefix++
 
-                var oldSuffixLen = old.length - prefix
-                var newSuffixLen = fresh.length - prefix
+                // compute suffix
                 var suffix = 0
+                val oldSuffixLen = old.length - prefix
+                val newSuffixLen = fresh.length - prefix
                 while (suffix < oldSuffixLen && suffix < newSuffixLen &&
                     old[old.length - 1 - suffix] == fresh[fresh.length - 1 - suffix]) suffix++
 
@@ -396,15 +468,24 @@ class EditorViewModel : ViewModel() {
                 val removeLen = old.length - prefix - suffix
                 val addText = if (fresh.length - prefix - suffix > 0) fresh.substring(prefix, fresh.length - suffix) else ""
 
+                val editType = when {
+                    removeLen > 0 && addText.isEmpty() -> HistoryManager.EditType.DELETING
+                    removeLen == 0 && addText.isNotEmpty() -> HistoryManager.EditType.INSERTING
+                    else -> HistoryManager.EditType.OTHER
+                }
+
+                if (editType == HistoryManager.EditType.OTHER) {
+                    history.finalizeExternal()
+                }
+
                 if (removeLen > 0) {
                     val op = doc.deleteWithOp(removeStart, removeLen)
-                    val inv = doc.invert(op)
-                    history.pushInverse(inv)
+                    history.pushOp(op, HistoryManager.EditType.DELETING)
                 }
+
                 if (addText.isNotEmpty()) {
                     val op = doc.insertWithOp(removeStart, addText)
-                    val inv = doc.invert(op)
-                    history.pushInverse(inv)
+                    history.pushOp(op, HistoryManager.EditType.INSERTING)
                 }
 
                 withContext(Dispatchers.Main) {
@@ -442,7 +523,11 @@ class EditorViewModel : ViewModel() {
                 val tab = cur.tabs[safeIdx]
                 val doc = docs[tab.docId] ?: return@withContext
                 val history = histories[tab.docId] ?: return@withContext
+
+                history.finalizeExternal()
+
                 if (isUndo) history.undo(doc) else history.redo(doc)
+
                 withContext(Dispatchers.Main) {
                     applyingModelUpdate = true
                     try {
@@ -529,6 +614,11 @@ class EditorViewModel : ViewModel() {
         }
         return name
     }
+
+    override fun onCleared() {
+        super.onCleared()
+        editorExecutor.shutdownNow()
+    }
 }
 
 // -------------------- MainActivity + Compose --------------------
@@ -554,27 +644,27 @@ fun TextEditorHost(vm: EditorViewModel = viewModel()) {
     val openLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.openFile(context, uri)
     }
-    val saveAsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+    val saveAsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
         if (uri != null) vm.saveToUri(context, uri)
         if (uri != null) Toast.makeText(context, "File saved!", Toast.LENGTH_SHORT).show()
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
         Row(modifier = Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-            Button(onClick = { openLauncher.launch(arrayOf("text/plain")) }, enabled = true) { Text("Load") }
+            Button(onClick = { openLauncher.launch(arrayOf("*/*")) }, enabled = true) { Text("Load") }
             Button(onClick = {
                 val idx = state.selectedIndex.coerceIn(0, maxOf(0, state.tabs.lastIndex))
                 if (idx in state.tabs.indices) {
                     val tab = state.tabs[idx]
                     if (tab.fileUri != null) vm.saveToUri(context, tab.fileUri)
-                    else saveAsLauncher.launch("${tab.fileName}.txt")
+                    else saveAsLauncher.launch(tab.fileName)
                 }
             }, enabled = state.tabs.isNotEmpty()) { Text("Save") }
             Button(onClick = {
                 val idx = state.selectedIndex.coerceIn(0, maxOf(0, state.tabs.lastIndex))
                 if (idx in state.tabs.indices) {
                     val tab = state.tabs[idx]
-                    saveAsLauncher.launch("${tab.fileName}.txt")
+                    saveAsLauncher.launch(tab.fileName)
                 }
             }, enabled = state.tabs.isNotEmpty()) { Text("Save As") }
             Button(onClick = { vm.undo() }, enabled = state.canUndo) { Text("Undo") }
@@ -583,14 +673,12 @@ fun TextEditorHost(vm: EditorViewModel = viewModel()) {
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             val tabsSnapshot = state.tabs      // snapshot once
-            // clamp using the same snapshot
             val selectedIndexForRow = tabsSnapshot
                 .let { tabs ->
                     if (tabs.isEmpty()) 0
                     else state.selectedIndex.coerceIn(0, tabs.lastIndex)
                 }
 
-            // Key by tabs size (or tabs IDs) to ensure children and selected index are from same snapshot
             key(tabsSnapshot.size, tabsSnapshot.map { it.id }.hashCode()) {
                 if (tabsSnapshot.isNotEmpty()) {
                     ScrollableTabRow(
