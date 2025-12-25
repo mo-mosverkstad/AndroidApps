@@ -49,7 +49,10 @@ import com.example.myapplication.lib.PieceTable
 
 // -------------------- HistoryManager --------------------
 
-class HistoryManager {
+import com.example.myapplication.lib.HistoryManager
+
+/*
+class HistoryManager{
 
     enum class EditType {
         INSERTING,
@@ -142,6 +145,8 @@ class HistoryManager {
     }
 }
 
+ */
+
 // -------------------- Editor model --------------------
 
 data class SelectionRange(val start: Int, val end: Int = start) {
@@ -171,7 +176,7 @@ data class EditorState(
 class EditorModel {
 
     private val docs = mutableMapOf<String, PieceTableDocument>()
-    private val histories = mutableMapOf<String, HistoryManager>()
+    private val histories = mutableMapOf<String, HistoryManager<PieceTableDocument, PieceTableMemento>>()
 
     private var state = EditorState()
     fun getState(): EditorState = state
@@ -306,7 +311,7 @@ class EditorModel {
 
     private fun rebuildAfterHistory(
         doc: PieceTableDocument,
-        hist: HistoryManager
+        hist: HistoryManager<PieceTableDocument, PieceTableMemento>
     ): EditorState {
 
         val text = doc.toString()

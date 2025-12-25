@@ -2,6 +2,7 @@ package com.example.myapplication.core
 
 import com.example.myapplication.lib.PieceRef
 import com.example.myapplication.lib.PieceTable
+import com.example.myapplication.lib.DocumentHistory
 
 data class PieceTableMemento(
     val pos: Int,
@@ -11,7 +12,7 @@ data class PieceTableMemento(
 
 class PieceTableDocument(
     private val table: PieceTable
-) {
+): DocumentHistory<PieceTableMemento> {
 
     val length: Int get() = table.length
     override fun toString(): String = table.toString()
@@ -34,7 +35,7 @@ class PieceTableDocument(
         )
     }
 
-    fun apply(m: PieceTableMemento): PieceTableMemento {
+    override fun apply(m: PieceTableMemento): PieceTableMemento {
         if (m.inserted.length > 0)
             table.deleteRange(m.pos, m.inserted.length)
 
