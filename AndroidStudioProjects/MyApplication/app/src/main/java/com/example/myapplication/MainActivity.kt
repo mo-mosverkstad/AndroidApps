@@ -39,24 +39,16 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.util.concurrent.Executors
-import kotlin.random.Random
 import java.util.UUID
 import java.util.ArrayDeque
 
 // -------------------- PieceTable / Treap --------------------
+import com.example.myapplication.core.PieceTableDocument
+import com.example.myapplication.core.PieceTableMemento
 import com.example.myapplication.lib.PieceTable
 
 // -------------------- HistoryManager --------------------
 
-/**
- * Simplified and robust HistoryManager that stores *original* ops (not inverses).
- * Behavior:
- * - pushOp(op, type) to add an operation (op is the operation that WAS applied to the document)
- * - batching of consecutive INSERTING or DELETING ops into one undo entry
- * - finalizeExternal() to finalize current batch (e.g. on Enter, selection change)
- * - undo(doc) applies inverses in reverse order
- * - redo(doc) reapplies original ops in original order
- */
 class HistoryManager {
 
     enum class EditType {
@@ -65,27 +57,31 @@ class HistoryManager {
         OTHER
     }
 
-    private val undo = ArrayDeque<List<PieceTable.Op>>()
-    private val redo = ArrayDeque<List<PieceTable.Op>>()
+    private val undo = ArrayDeque<List<PieceTableMemento>>()
+    private val redo = ArrayDeque<List<PieceTableMemento>>()
 
-    private var currentBatch: MutableList<PieceTable.Op> = mutableListOf()
-    private var lastEditType: EditType? = null
+    private var currentBatch = mutableListOf<PieceTableMemento>()
+    private var lastType: EditType? = null
 
-    val canUndo: Boolean get() = undo.isNotEmpty() || currentBatch.isNotEmpty()
-    val canRedo: Boolean get() = redo.isNotEmpty()
+    val canUndo: Boolean
+        get() = undo.isNotEmpty() || currentBatch.isNotEmpty()
+
+    val canRedo: Boolean
+        get() = redo.isNotEmpty()
 
     private fun shouldMerge(type: EditType): Boolean {
         if (currentBatch.isEmpty()) return true
-        return (lastEditType == type) && (type == EditType.INSERTING || type == EditType.DELETING)
+        return lastType == type &&
+                (type == EditType.INSERTING || type == EditType.DELETING)
     }
 
     @Synchronized
-    fun pushOp(op: PieceTable.Op, type: EditType) {
+    fun push(m: PieceTableMemento, type: EditType) {
         if (type == EditType.OTHER) {
             finalizeBatchLocked()
-            undo.addLast(listOf(op))
+            undo.addLast(listOf(m))
             redo.clear()
-            lastEditType = null
+            lastType = null
             return
         }
 
@@ -93,8 +89,8 @@ class HistoryManager {
             finalizeBatchLocked()
         }
 
-        currentBatch.add(op)
-        lastEditType = type
+        currentBatch.add(m)
+        lastType = type
         redo.clear()
     }
 
@@ -109,69 +105,56 @@ class HistoryManager {
             undo.addLast(currentBatch.toList())
             currentBatch.clear()
         }
-        lastEditType = null
+        lastType = null
     }
 
     @Synchronized
-    fun undo(doc: PieceTable): Boolean {
+    fun undo(doc: PieceTableDocument): Boolean {
         finalizeBatchLocked()
-        val batch = if (undo.isEmpty()) null else undo.removeLast() ?: return false
-        val redoBatch = mutableListOf<PieceTable.Op>()
+        if (undo.isEmpty()) return false
 
-        // Apply inverses in reverse order
-        if (batch != null) {
-            for (op in batch.asReversed()) {
-                val inv = doc.invert(op)
-                doc.apply(inv)
-                redoBatch.add(op) // for redo we will reapply original ops
-            }
+        val batch = undo.removeLast()
+        val redoBatch = mutableListOf<PieceTableMemento>()
+
+        for (m in batch.asReversed()) {
+            val inverse = doc.apply(m)
+            redoBatch.add(inverse)
         }
 
-        // push original ops for redo in their original order
-        redo.addLast(redoBatch.asReversed().toMutableList())
-        lastEditType = null
+        redo.addLast(redoBatch.asReversed())
         return true
     }
 
     @Synchronized
-    fun redo(doc: PieceTable): Boolean {
-        val batch = if (redo.isEmpty()) null else redo.removeLast() ?: return false
-        val undoBatch = mutableListOf<PieceTable.Op>()
+    fun redo(doc: PieceTableDocument): Boolean {
+        if (redo.isEmpty()) return false
 
-        if (batch != null) {
-            for (op in batch) {
-                doc.apply(op)
-                undoBatch.add(op)
-            }
+        val batch = redo.removeLast()
+        val undoBatch = mutableListOf<PieceTableMemento>()
+
+        for (m in batch) {
+            val inverse = doc.apply(m)
+            undoBatch.add(inverse)
         }
 
-        undo.addLast(undoBatch.toList())
-        lastEditType = null
+        undo.addLast(undoBatch)
         return true
-    }
-
-    override fun toString(): String {
-        return "HistoryManager(undo=${undo.size}, redo=${redo.size}, pending=${currentBatch.size})"
     }
 }
 
 // -------------------- Editor model --------------------
 
-// A platform-independent way to represent a text selection range.
-// It replaces androidx.compose.ui.text.TextRange.
 data class SelectionRange(val start: Int, val end: Int = start) {
     init {
-        require(start >= 0 && end >= 0) { "Selection must be non-negative" }
-        require(start <= end) { "Selection start must be <= end" }
+        require(start >= 0 && end >= 0)
+        require(start <= end)
     }
 }
-
 
 data class TabMeta(
     val id: String = UUID.randomUUID().toString(),
     val docId: String,
     val fileName: String,
-    // Replaced Android's Uri with a platform-agnostic String path.
     val filePath: String? = null,
     val isDirty: Boolean = false
 )
@@ -180,7 +163,6 @@ data class EditorState(
     val tabs: List<TabMeta> = emptyList(),
     val selectedIndex: Int = 0,
     val visibleText: String = "",
-    // Use the new platform-independent SelectionRange.
     val selection: SelectionRange = SelectionRange(0),
     val canUndo: Boolean = false,
     val canRedo: Boolean = false
@@ -188,7 +170,7 @@ data class EditorState(
 
 class EditorModel {
 
-    private val docs = mutableMapOf<String, PieceTable>()
+    private val docs = mutableMapOf<String, PieceTableDocument>()
     private val histories = mutableMapOf<String, HistoryManager>()
 
     private var state = EditorState()
@@ -205,22 +187,27 @@ class EditorModel {
     // -----------------------------------------------------
     // TAB CREATION
     // -----------------------------------------------------
-    // The signature now accepts a String 'filePath' instead of an Android 'Uri'.
-    fun createTab(initialText: String, fileName: String, filePath: String? = null): EditorState {
-        val docId = UUID.randomUUID().toString()
+    fun createTab(
+        initialText: String,
+        fileName: String,
+        filePath: String? = null
+    ): EditorState {
 
-        docs[docId] = PieceTable(initialText)
+        val docId = UUID.randomUUID().toString()
+        val doc = PieceTableDocument(PieceTable(initialText))
+
+        docs[docId] = doc
         histories[docId] = HistoryManager()
 
-        val newTab = TabMeta(docId = docId, fileName = fileName, filePath = filePath, isDirty = false)
-        val tabs = state.tabs + newTab
-        val idx = tabs.lastIndex
-
-        val doc = docs[docId]!!
+        val tabs = state.tabs + TabMeta(
+            docId = docId,
+            fileName = fileName,
+            filePath = filePath
+        )
 
         state = state.copy(
             tabs = tabs,
-            selectedIndex = idx,
+            selectedIndex = tabs.lastIndex,
             visibleText = doc.toString(),
             selection = SelectionRange(doc.length),
             canUndo = false,
@@ -234,25 +221,21 @@ class EditorModel {
     // -----------------------------------------------------
     fun closeTab(tabId: String): EditorState {
         val idx = state.tabs.indexOfFirst { it.id == tabId }
-        if (idx == -1) return state
+        if (idx < 0) return state
 
         val newTabs = state.tabs.toMutableList().also { it.removeAt(idx) }
         val newIdx = clampIndex(newTabs, idx)
 
-        val newVisible =
-            if (newTabs.isEmpty()) ""
-            else {
-                val docId = newTabs[newIdx].docId
-                docs[docId]?.toString() ?: ""
-            }
+        val newText =
+            newTabs.getOrNull(newIdx)?.let { docs[it.docId]?.toString() } ?: ""
 
         val hist = newTabs.getOrNull(newIdx)?.let { histories[it.docId] }
 
         state = state.copy(
             tabs = newTabs,
             selectedIndex = newIdx,
-            visibleText = newVisible,
-            selection = SelectionRange(newVisible.length),
+            visibleText = newText,
+            selection = SelectionRange(newText.length),
             canUndo = hist?.canUndo ?: false,
             canRedo = hist?.canRedo ?: false
         )
@@ -260,21 +243,20 @@ class EditorModel {
     }
 
     fun markTabClean(tabId: String) {
-        val updatedTabs = state.tabs.toMutableList()
-        val idx = updatedTabs.indexOfFirst { it.id == tabId }
+        val tabs = state.tabs.toMutableList()
+        val idx = tabs.indexOfFirst { it.id == tabId }
         if (idx >= 0) {
-            updatedTabs[idx] = updatedTabs[idx].copy(isDirty = false)
-            state = state.copy(tabs = updatedTabs)
+            tabs[idx] = tabs[idx].copy(isDirty = false)
+            state = state.copy(tabs = tabs)
         }
     }
 
-    // The signature now accepts a String 'newPath' instead of an Android 'Uri'.
-    fun updateTabFileInfo(tabId: String, newFileName: String, newPath: String) {
-        val updatedTabs = state.tabs.toMutableList()
-        val idx = updatedTabs.indexOfFirst { it.id == tabId }
+    fun updateTabFileInfo(tabId: String, newName: String, newPath: String) {
+        val tabs = state.tabs.toMutableList()
+        val idx = tabs.indexOfFirst { it.id == tabId }
         if (idx >= 0) {
-            updatedTabs[idx] = updatedTabs[idx].copy(fileName = newFileName, filePath = newPath)
-            state = state.copy(tabs = updatedTabs)
+            tabs[idx] = tabs[idx].copy(fileName = newName, filePath = newPath)
+            state = state.copy(tabs = tabs)
         }
     }
 
@@ -283,19 +265,20 @@ class EditorModel {
     // -----------------------------------------------------
     fun selectTab(tabId: String): EditorState {
         val idx = state.tabs.indexOfFirst { it.id == tabId }
-        if (idx == -1) return state
+        if (idx < 0) return state
 
         val tab = state.tabs[idx]
-        histories[tab.docId]?.finalizeExternal()
-
+        val hist = histories[tab.docId]!!
         val doc = docs[tab.docId]!!
+
+        hist.finalizeExternal()
 
         state = state.copy(
             selectedIndex = idx,
             visibleText = doc.toString(),
             selection = SelectionRange(doc.length),
-            canUndo = histories[tab.docId]!!.canUndo,
-            canRedo = histories[tab.docId]!!.canRedo
+            canUndo = hist.canUndo,
+            canRedo = hist.canRedo
         )
         return state
     }
@@ -308,10 +291,8 @@ class EditorModel {
         val doc = docs[tab.docId]!!
         val hist = histories[tab.docId]!!
 
-        hist.finalizeExternal()
         hist.undo(doc)
-
-        return rebuildStateAfterHistory(doc, hist)
+        return rebuildAfterHistory(doc, hist)
     }
 
     fun redo(): EditorState {
@@ -319,23 +300,24 @@ class EditorModel {
         val doc = docs[tab.docId]!!
         val hist = histories[tab.docId]!!
 
-        hist.finalizeExternal()
         hist.redo(doc)
-
-        return rebuildStateAfterHistory(doc, hist)
+        return rebuildAfterHistory(doc, hist)
     }
 
-    private fun rebuildStateAfterHistory(doc: PieceTable, hist: HistoryManager): EditorState {
-        val newText = doc.toString()
-        val newSel = SelectionRange(newText.length)
+    private fun rebuildAfterHistory(
+        doc: PieceTableDocument,
+        hist: HistoryManager
+    ): EditorState {
 
-        val updatedTabs = state.tabs.toMutableList()
-        updatedTabs[state.selectedIndex] = updatedTabs[state.selectedIndex].copy(isDirty = true)
+        val text = doc.toString()
+        val tabs = state.tabs.toMutableList()
+        tabs[state.selectedIndex] =
+            tabs[state.selectedIndex].copy(isDirty = true)
 
         state = state.copy(
-            tabs = updatedTabs,
-            visibleText = newText,
-            selection = newSel,
+            tabs = tabs,
+            visibleText = text,
+            selection = SelectionRange(text.length),
             canUndo = hist.canUndo,
             canRedo = hist.canRedo
         )
@@ -343,44 +325,42 @@ class EditorModel {
     }
 
     // -----------------------------------------------------
-    // UI TEXT DIFF APPLIED TO MODEL
+    // TEXT DIFF FROM UI
     // -----------------------------------------------------
-    fun applyTextChange(removeStart: Int, removeLen: Int, addText: String): EditorState {
+    fun applyTextChange(
+        removeStart: Int,
+        removeLen: Int,
+        addText: String
+    ): EditorState {
+
         val tab = state.tabs[state.selectedIndex]
         val doc = docs[tab.docId]!!
         val hist = histories[tab.docId]!!
 
-        val editType = when {
+        val type = when {
             removeLen > 0 && addText.isEmpty() -> HistoryManager.EditType.DELETING
             removeLen == 0 && addText.isNotEmpty() -> HistoryManager.EditType.INSERTING
             else -> HistoryManager.EditType.OTHER
         }
 
-        if (editType == HistoryManager.EditType.OTHER)
+        if (type == HistoryManager.EditType.OTHER)
             hist.finalizeExternal()
 
         if (removeLen > 0)
-            hist.pushOp(doc.deleteWithOp(removeStart, removeLen), HistoryManager.EditType.DELETING)
+            hist.push(doc.delete(removeStart, removeLen), HistoryManager.EditType.DELETING)
 
         if (addText.isNotEmpty())
-            hist.pushOp(doc.insertWithOp(removeStart, addText), HistoryManager.EditType.INSERTING)
+            hist.push(doc.insert(removeStart, addText), HistoryManager.EditType.INSERTING)
 
-        // This part was cut off in the original file, but it would likely rebuild
-        // the state similar to how rebuildStateAfterHistory does.
-        // For completeness, it would look something like this:
-
-        val newText = doc.toString()
-        // Here you would also update selection based on the change,
-        // but for now we'll just move it to the end of the change.
-        val newSelection = SelectionRange(removeStart + addText.length)
-
-        val updatedTabs = state.tabs.toMutableList()
-        updatedTabs[state.selectedIndex] = updatedTabs[state.selectedIndex].copy(isDirty = true)
+        val text = doc.toString()
+        val tabs = state.tabs.toMutableList()
+        tabs[state.selectedIndex] =
+            tabs[state.selectedIndex].copy(isDirty = true)
 
         state = state.copy(
-            tabs = updatedTabs,
-            visibleText = newText,
-            selection = newSelection,
+            tabs = tabs,
+            visibleText = text,
+            selection = SelectionRange(removeStart + addText.length),
             canUndo = hist.canUndo,
             canRedo = hist.canRedo
         )
