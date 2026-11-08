@@ -1,8 +1,7 @@
-// MainActivity.kt
 package com.example.myapplication
 
 import android.content.Context
-import android.database.Cursor
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -12,205 +11,273 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ScrollableTabRow
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
+import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.myapplication.core.EditorState
+import com.example.myapplication.core.NativeEditor
+import com.example.myapplication.core.SelectionRange
+import com.example.myapplication.core.TabMeta
 import com.example.myapplication.ui.theme.MyApplicationTheme
-import kotlinx.coroutines.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import java.io.BufferedReader
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
-import java.util.concurrent.Executors
-import androidx.core.net.toUri
-import android.util.Log
-import androidx.compose.ui.graphics.vector.path
+import java.nio.charset.StandardCharsets
 
-import com.example.myapplication.core.EditorModel
-import com.example.myapplication.core.EditorState
+private const val DEFAULT_FILE_NAME = "untitled.txt"
 
-
+/**
+ * Holds the native editor and the Android-side concerns around it: file I/O
+ * through the Storage Access Framework, and one-shot user messages.
+ *
+ * All editor state lives in the C++ core. This class never second-guesses it;
+ * it forwards an event and republishes the resulting snapshot.
+ */
 class EditorViewModel : ViewModel() {
 
-    private val model = EditorModel()
+    private val editor = NativeEditor()
 
-    private val _uiState = MutableStateFlow(EditorState())
-    val uiState: StateFlow<EditorState> = _uiState
+    private val _uiState = MutableStateFlow(editor.state())
+    val uiState: StateFlow<EditorState> = _uiState.asStateFlow()
 
-    @Volatile
-    var applyingModelUpdate = false
+    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    val messages: SharedFlow<String> = _messages.asSharedFlow()
 
-    // NO MORE THREADING CODE HERE. It's all gone.
-
-    private fun pushState() {
-        _uiState.value = model.getState()
+    override fun onCleared() {
+        editor.close()
+        super.onCleared()
     }
 
-    // ---------------------------------------------------------
-    // TABS
-    // ---------------------------------------------------------
+    private fun publish() {
+        _uiState.value = editor.state()
+    }
+
+    // --- tabs --------------------------------------------------------------
+
     fun newTab() {
-        model.createTab("", "New File")
-        pushState()
+        editor.createTab(text = "", fileName = DEFAULT_FILE_NAME)
+        publish()
     }
 
-    fun closeTabById(id: String) {
-        model.closeTab(id)
-        pushState()
+    fun closeTab(tabId: Long) {
+        editor.closeTab(tabId)
+        publish()
     }
 
-    fun selectTabById(id: String) {
-        model.selectTab(id)
-        pushState()
+    fun selectTab(tabId: Long) {
+        editor.selectTab(tabId)
+        publish()
     }
 
-    fun markTabClean(tabId: String) {
-        model.markTabClean(tabId)
-        pushState()
+    // --- editing -----------------------------------------------------------
+
+    /**
+     * Feeds a whole new [TextFieldValue] to the core, which works out what the
+     * actual edit was. Both the text and the caret are forwarded, so the core
+     * can group typing correctly and restore the caret on undo.
+     */
+    fun onEditorInput(value: TextFieldValue) {
+        val changed = editor.setText(
+            text = value.text,
+            selection = SelectionRange(value.selection.start, value.selection.end)
+        )
+        if (changed) publish()
     }
 
-    fun updateTabFileInfo(tabId: String, newFileName: String, newUri: Uri) {
-        model.updateTabFileInfo(tabId, newFileName, newUri.toString())
-        pushState()
-    }
-
-
-    // ---------------------------------------------------------
-    // UNDO / REDO
-    // ---------------------------------------------------------
     fun undo() {
-        model.undo()
-        pushState()
+        if (editor.undo()) publish()
     }
 
     fun redo() {
-        model.redo()
-        pushState()
+        if (editor.redo()) publish()
     }
 
-    // ---------------------------------------------------------
-    // TEXT CHANGE FROM UI - SIMPLE & DIRECT
-    // ---------------------------------------------------------
-    fun applyTextChangeFromUi(newValue: TextFieldValue) {
-        // No more jobs, no more delays. Process the change immediately.
-        val old = model.getState().visibleText
-        val fresh = newValue.text
-        if (old == fresh) {
-            return
-        }
+    // --- file I/O ----------------------------------------------------------
 
-        val min = minOf(old.length, fresh.length)
-        var prefix = 0
-        while (prefix < min && old[prefix] == fresh[prefix]) prefix++
-
-        var suffix = 0
-        val oldRemaining = old.length - prefix
-        val newRemaining = fresh.length - prefix
-        while (suffix < oldRemaining && suffix < newRemaining &&
-            old[old.length - 1 - suffix] == fresh[fresh.length - 1 - suffix]) suffix++
-
-        val removeStart = prefix
-        val removeLen = old.length - prefix - suffix
-        val addText = if (fresh.length - prefix - suffix > 0)
-            fresh.substring(prefix, fresh.length - suffix)
-        else ""
-
-        model.applyTextChange(removeStart, removeLen, addText)
-
-        applyingModelUpdate = true
-        pushState()
-        applyingModelUpdate = false
-    }
-
-    // ---------------------------------------------------------
-    // FILE I/O (ANDROID) - SIMPLE & DIRECT
-    // ---------------------------------------------------------
     fun openFile(context: Context, uri: Uri) {
-        // Use a background thread ONLY for reading the file from disk.
-        viewModelScope.launch(Dispatchers.IO) {
-            val text = readFile(context, uri)
-            val name = getFileName(context, uri) ?: "Untitled"
+        viewModelScope.launch {
+            val loaded = runCatching {
+                withContext(Dispatchers.IO) {
+                    persistPermission(context, uri)
+                    readText(context, uri) to queryDisplayName(context, uri)
+                }
+            }
+            loaded
+                .onSuccess { (text, name) ->
+                    editor.createTab(
+                        text = text,
+                        fileName = name ?: uri.lastPathSegment ?: DEFAULT_FILE_NAME,
+                        filePath = uri.toString()
+                    )
+                    publish()
+                }
+                .onFailure { error ->
+                    _messages.tryEmit("Couldn't open file: ${error.describe()}")
+                }
+        }
+    }
 
-            // Switch back to the main thread to update the model and UI.
-            withContext(Dispatchers.Main) {
-                model.createTab(text, name, uri.toString())
-                pushState()
+    /** Saves the active tab to a path it already knows about. */
+    fun saveActiveTab(context: Context, uri: Uri) {
+        viewModelScope.launch { performSave(context, uri, renameTo = null) }
+    }
+
+    /** Saves the active tab to a newly chosen location and adopts its name. */
+    fun saveActiveTabAs(context: Context, uri: Uri) {
+        viewModelScope.launch {
+            val name = runCatching {
+                withContext(Dispatchers.IO) { queryDisplayName(context, uri) }
+            }.getOrNull()
+            performSave(context, uri, renameTo = name)
+        }
+    }
+
+    /**
+     * The tab is only marked clean once the bytes are actually on disk, and
+     * only if the document has not moved on in the meantime. The previous
+     * implementation marked it clean and showed "File saved!" before the write
+     * had even started, so a failed write looked like a success.
+     */
+    private suspend fun performSave(context: Context, uri: Uri, renameTo: String?) {
+        val tab = editor.state().activeTab ?: return
+
+        editor.finalizeEdits()
+        val snapshot = editor.activeText()
+
+        val outcome = runCatching {
+            withContext(Dispatchers.IO) {
+                persistPermission(context, uri)
+                writeText(context, uri, snapshot)
             }
         }
-    }
 
-    fun saveToUri(context: Context, uri: Uri) {
-        // The model is ALWAYS up-to-date now. No waiting is needed.
+        outcome
+            .onSuccess {
+                val name = renameTo ?: tab.fileName
+                editor.setTabFile(tab.id, name, uri.toString())
 
-        // 1. Finalize the undo group.
-        model.finalizeActiveEdits()
+                val stillCurrent = editor.state().activeTab?.id == tab.id &&
+                    editor.activeText() == snapshot
+                if (stillCurrent) editor.markTabSaved(tab.id)
 
-        // 2. Get the fresh, correct text.
-        val text = model.getActiveDocumentText()
-
-        Log.d("SAVE_DEBUG", "Text being saved: '$text'")
-
-        // 3. Launch a simple background job ONLY for writing to disk.
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                writeFile(context, uri, text)
-            } catch (e: Exception) {
-                Log.e("SAVE_DEBUG", "Error saving file", e)
+                publish()
+                _messages.tryEmit(
+                    if (stillCurrent) "Saved $name" else "Saved $name (document changed since)"
+                )
             }
+            .onFailure { error ->
+                _messages.tryEmit("Couldn't save: ${error.describe()}")
+            }
+    }
+
+    // --- helpers -----------------------------------------------------------
+
+    private fun Throwable.describe(): String = message ?: this::class.java.simpleName
+
+    /**
+     * Keeps the grant alive across process death. Without this, saving back to
+     * a file opened in an earlier session fails with a SecurityException.
+     */
+    private fun persistPermission(context: Context, uri: Uri) {
+        try {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (_: SecurityException) {
+            // Some providers do not offer a persistable grant. The one-shot
+            // grant for this session still works, so carry on.
         }
     }
 
-    // ---------------------------------------------------------
-    // HELPERS
-    // ---------------------------------------------------------
-    private fun readFile(context: Context, uri: Uri): String {
-        return context.contentResolver.openInputStream(uri)?.use { stream ->
-            BufferedReader(InputStreamReader(stream)).use { it.readText() }
-        } ?: ""
-    }
-
-    private fun writeFile(context: Context, uri: Uri, text: String) {
-        context.contentResolver.openOutputStream(uri)?.use { stream ->
-            OutputStreamWriter(stream).use { it.write(text) }
+    private fun readText(context: Context, uri: Uri): String {
+        val stream = context.contentResolver.openInputStream(uri)
+            ?: throw IOException("No input stream for $uri")
+        return stream.use { input ->
+            InputStreamReader(input, StandardCharsets.UTF_8).use { it.readText() }
         }
     }
 
-    private fun getFileName(context: Context, uri: Uri): String? {
-        var name: String? = null
+    private fun writeText(context: Context, uri: Uri, text: String) {
+        val resolver = context.contentResolver
+
+        // "wt" truncates first. With a plain "w" the provider may keep the
+        // tail of the previous, longer file.
+        val stream = try {
+            resolver.openOutputStream(uri, "wt")
+        } catch (_: Exception) {
+            resolver.openOutputStream(uri)
+        } ?: throw IOException("No output stream for $uri")
+
+        stream.use { output ->
+            OutputStreamWriter(output, StandardCharsets.UTF_8).use { it.write(text) }
+        }
+    }
+
+    private fun queryDisplayName(context: Context, uri: Uri): String? {
         if (uri.scheme == "content") {
             context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                 val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (cursor.moveToFirst() && index >= 0) {
-                    name = cursor.getString(index)
+                if (index >= 0 && cursor.moveToFirst()) {
+                    cursor.getString(index)?.let { return it }
                 }
             }
         }
-        return name ?: uri.path?.substringAfterLast('/')
+        return uri.path?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
     }
-
-    // onCleared is no longer needed.
 }
 
-
-
-// -------------------- MainActivity + Compose --------------------
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -225,71 +292,61 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-
 @Composable
 fun TextEditorHost(vm: EditorViewModel = viewModel()) {
     val context = LocalContext.current
     val state by vm.uiState.collectAsState()
 
-    // Open file launcher
-    val openLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) vm.openFile(context, uri)
-    }
+    var pendingClose by remember { mutableStateOf<TabMeta?>(null) }
 
-    // Save As launcher with updated logic
-    val saveAsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
-        if (uri != null) {
-            val idx = state.selectedIndex.coerceIn(0, maxOf(0, state.tabs.lastIndex))
-            if (idx in state.tabs.indices) {
-                val tab = state.tabs[idx]
-                vm.saveToUri(context, uri)
-                vm.updateTabFileInfo(tab.id, tab.fileName, uri) // ✅ Update file info
-                vm.markTabClean(tab.id) // ✅ Reset dirty flag
-            }
-            Toast.makeText(context, "File saved!", Toast.LENGTH_SHORT).show()
+    LaunchedEffect(vm) {
+        vm.messages.collect { message ->
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
         }
     }
 
+    val openLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) vm.openFile(context, uri) }
+
+    val saveAsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri -> if (uri != null) vm.saveActiveTabAs(context, uri) }
+
+    val activeTab = state.activeTab
+
     Column(modifier = Modifier.fillMaxSize()) {
-        // Toolbar Row
+
         Row(
-            modifier = Modifier.fillMaxWidth().padding(8.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Button(onClick = { openLauncher.launch(arrayOf("*/*")) }, enabled = true) {
+            Button(onClick = { openLauncher.launch(arrayOf("*/*")) }) {
                 Text("Load")
             }
 
-            // ✅ Save button: mark tab clean after saving
-            Button(onClick = {
-                val idx = state.selectedIndex.coerceIn(0, maxOf(0, state.tabs.lastIndex))
-                if (idx in state.tabs.indices) {
-                    // val tab = state.tabs[idx]
-                    // In the "Save" button's onClick lambda
-                    val tab = state.tabs[idx]
-                    if (tab.filePath != null) {
-                        // Convert the filePath String back to a Uri for Android file operations
-                        vm.saveToUri(context, tab.filePath.toUri())
-                        vm.markTabClean(tab.id)
+            Button(
+                onClick = {
+                    val tab = activeTab ?: return@Button
+                    val path = tab.filePath
+                    if (path != null) {
+                        vm.saveActiveTab(context, path.toUri())
                     } else {
-                        // If there's no path, trigger "Save As"
                         saveAsLauncher.launch(tab.fileName)
                     }
-
-                }
-            }, enabled = state.tabs.isNotEmpty()) {
+                },
+                enabled = activeTab != null
+            ) {
                 Text("Save")
             }
 
-            // ✅ Save As button: triggers launcher
-            Button(onClick = {
-                val idx = state.selectedIndex.coerceIn(0, maxOf(0, state.tabs.lastIndex))
-                if (idx in state.tabs.indices) {
-                    val tab = state.tabs[idx]
-                    saveAsLauncher.launch(tab.fileName)
-                }
-            }, enabled = state.tabs.isNotEmpty()) {
+            Button(
+                onClick = { activeTab?.let { saveAsLauncher.launch(it.fileName) } },
+                enabled = activeTab != null
+            ) {
                 Text("Save As")
             }
 
@@ -297,95 +354,149 @@ fun TextEditorHost(vm: EditorViewModel = viewModel()) {
             Button(onClick = { vm.redo() }, enabled = state.canRedo) { Text("Redo") }
         }
 
-        // Tabs Row
         Row(verticalAlignment = Alignment.CenterVertically) {
-            val tabsSnapshot = state.tabs
-            val selectedIndexForRow = tabsSnapshot.let { tabs ->
-                if (tabs.isEmpty()) 0 else state.selectedIndex.coerceIn(0, tabs.lastIndex)
-            }
-
-            key(tabsSnapshot.size, tabsSnapshot.map { it.id }.hashCode()) {
-                if (tabsSnapshot.isNotEmpty()) {
-                    ScrollableTabRow(
-                        selectedTabIndex = selectedIndexForRow,
-                        modifier = Modifier.weight(1f),
-                        edgePadding = 0.dp
-                    ) {
-                        tabsSnapshot.forEachIndexed { idx, tab ->
-                            key(tab.id) {
-                                Tab(
-                                    selected = idx == selectedIndexForRow,
-                                    onClick = { vm.selectTabById(tab.id) },
-                                    text = {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text(tab.fileName + if (tab.isDirty) "*" else "", maxLines = 1)
-                                            Spacer(Modifier.width(4.dp))
-                                            IconButton(onClick = { vm.closeTabById(tab.id) }, modifier = Modifier.size(22.dp)) {
-                                                Icon(Icons.Default.Close, contentDescription = "Close Tab", modifier = Modifier.size(16.dp))
-                                            }
+            if (state.tabs.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 12.dp)
+                ) {
+                    Text("No files open")
+                }
+            } else {
+                ScrollableTabRow(
+                    selectedTabIndex = state.selectedIndex.coerceIn(0, state.tabs.lastIndex),
+                    modifier = Modifier.weight(1f),
+                    edgePadding = 0.dp
+                ) {
+                    state.tabs.forEachIndexed { index, tab ->
+                        key(tab.id) {
+                            Tab(
+                                selected = index == state.selectedIndex,
+                                onClick = { vm.selectTab(tab.id) },
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = tab.fileName + if (tab.isDirty) "*" else "",
+                                            maxLines = 1
+                                        )
+                                        Spacer(Modifier.width(4.dp))
+                                        IconButton(
+                                            onClick = {
+                                                if (tab.isDirty) {
+                                                    pendingClose = tab
+                                                } else {
+                                                    vm.closeTab(tab.id)
+                                                }
+                                            },
+                                            modifier = Modifier.size(22.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Close,
+                                                contentDescription = "Close ${tab.fileName}",
+                                                modifier = Modifier.size(16.dp)
+                                            )
                                         }
                                     }
-                                )
-                            }
+                                }
+                            )
                         }
                     }
-                } else {
-                    Box(modifier = Modifier.weight(1f).padding(start = 12.dp)) { Text("No files open") }
                 }
             }
 
-            IconButton(onClick = { vm.newTab() }) { Icon(Icons.Default.Add, contentDescription = "New Tab") }
-        }
-
-        // Editor Area
-        Box(modifier = Modifier.fillMaxSize().padding(8.dp)) {
-            // In the editor area Box
-            Box(modifier = Modifier.fillMaxSize().padding(8.dp)) {
-                var textState by remember(state.tabs, state.visibleText) {
-                    // Convert your custom SelectionRange to Compose's TextRange
-                    mutableStateOf(
-                        TextFieldValue(
-                            text = state.visibleText,
-                            selection = TextRange(state.selection.start, state.selection.end)
-                        )
-                    )
-                }
-
-                LaunchedEffect(state.visibleText, state.selection) {
-                    // Also convert here when the state from the ViewModel changes
-                    if (state.visibleText != textState.text ||
-                        TextRange(state.selection.start, state.selection.end) != textState.selection) {
-                        textState = TextFieldValue(
-                            text = state.visibleText,
-                            selection = TextRange(state.selection.start, state.selection.end)
-                        )
-                    }
-                }
-
-                if (state.tabs.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("Open or create a file to start editing")
-                    }
-                } else {
-                    BasicTextField(
-                        value = textState,
-                        onValueChange = { newValue ->
-                            if (vm.applyingModelUpdate) {
-                                textState = newValue
-                                return@BasicTextField
-                            }
-                            if (newValue.text == textState.text) {
-                                textState = newValue
-                                vm.applyTextChangeFromUi(newValue)
-                                return@BasicTextField
-                            }
-                            textState = newValue
-                            vm.applyTextChangeFromUi(newValue)
-                        },
-                        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
-                    )
-                }
+            IconButton(onClick = { vm.newTab() }) {
+                Icon(Icons.Default.Add, contentDescription = "New tab")
             }
         }
-    }}
 
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(8.dp)
+        ) {
+            if (activeTab == null) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Open or create a file to start editing")
+                }
+            } else {
+                EditorTextField(
+                    tabId = activeTab.id,
+                    text = state.visibleText,
+                    selection = state.selection,
+                    onValueChange = vm::onEditorInput
+                )
+            }
+        }
+    }
+
+    pendingClose?.let { tab ->
+        AlertDialog(
+            onDismissRequest = { pendingClose = null },
+            title = { Text("Discard changes?") },
+            text = { Text("${tab.fileName} has unsaved changes. Closing it will lose them.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.closeTab(tab.id)
+                    pendingClose = null
+                }) {
+                    Text("Discard")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingClose = null }) { Text("Keep editing") }
+            }
+        )
+    }
+}
+
+/**
+ * Mirrors the core's text and caret into a [TextFieldValue].
+ *
+ * The local copy is keyed on the tab id alone. Keying it on the text, as the
+ * previous version did, re-created the state on every keystroke and fought
+ * IME composition.
+ */
+@Composable
+private fun EditorTextField(
+    tabId: Long,
+    text: String,
+    selection: SelectionRange,
+    onValueChange: (TextFieldValue) -> Unit
+) {
+    var field by remember(tabId) {
+        mutableStateOf(TextFieldValue(text, TextRange(selection.start, selection.end)))
+    }
+
+    val fromCore = toTextFieldValue(text, selection)
+    LaunchedEffect(tabId, text, selection) {
+        if (field.text != fromCore.text || field.selection != fromCore.selection) {
+            field = fromCore
+        }
+    }
+
+    BasicTextField(
+        value = field,
+        onValueChange = { updated ->
+            field = updated
+            onValueChange(updated)
+        },
+        textStyle = TextStyle(
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.onSurface
+        ),
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        modifier = Modifier.fillMaxSize()
+    )
+}
+
+private fun toTextFieldValue(text: String, selection: SelectionRange): TextFieldValue {
+    val limit = text.length
+    return TextFieldValue(
+        text = text,
+        selection = TextRange(
+            selection.start.coerceIn(0, limit),
+            selection.end.coerceIn(0, limit)
+        )
+    )
+}

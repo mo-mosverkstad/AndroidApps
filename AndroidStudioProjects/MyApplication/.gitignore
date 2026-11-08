@@ -13,3 +13,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+# desktop builds of the native editor core
+/native/build
+/native/cmake-build-*

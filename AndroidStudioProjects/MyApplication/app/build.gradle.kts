@@ -16,6 +16,23 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        externalNativeBuild {
+            cmake {
+                // The core is plain C++17. Exceptions are on: the piece table
+                // reports out-of-range edits by throwing, and the JNI layer
+                // converts those into Java exceptions.
+                cppFlags += listOf("-std=c++17", "-fexceptions")
+                arguments += listOf("-DANDROID_STL=c++_static")
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
